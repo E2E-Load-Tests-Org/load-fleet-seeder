@@ -9,8 +9,8 @@
 # machines.
 #
 # One matrix job per fleet repository. Idempotent: a repository whose marker branch exists
-# is done and skipped; one that holds refs but no marker (an interrupted job) gets only
-# its marker. Safe by construction: it refuses any org or source in Veeam-Cloud, any
+# is done and skipped; one that holds refs but no marker (an interrupted job) is pushed
+# again (refs already there are no-ops) and then gets its marker. Safe by construction: it refuses any org or source in Veeam-Cloud, any
 # target org other than the one this workflow runs in, and any fleet repository whose
 # Actions are still on.
 name: seed-fleet
@@ -56,6 +56,9 @@ jobs:
       # GITHUB_TOKEN cannot push to another repository, and no token may push workflow
       # files without the workflow permission: a PAT secret is required (trap b).
       TOKEN: ${{ secrets[inputs.token_secret] }}
+      # Tags per push (trap g: push protection's secret scan times out on ~1300 at once).
+      TAG_BATCH: '100'
+      PUSH_TIMEOUT: '20m'
     steps:
       - name: Mirror the source and add the marker commit
         shell: bash
@@ -84,28 +87,37 @@ jobs:
             echo "$NAME already carries $MARKER: done"; exit 0
           fi
 
-          if [ -z "$(g ls-remote --heads "$target")" ]; then
-            # --bare takes refs/heads and refs/tags only: never refs/pull/*, which GitHub
-            # refuses to receive (hidden refs). The source is public: no credential.
-            git clone --bare --quiet "https://github.com/$SOURCE.git" src.git
-            cd src.git
-            head=$(git symbolic-ref --short HEAD)
-            if [ "$CHUNK" -gt 0 ]; then
-              # Trap c: stay under the 2 GB push limit by pushing the default branch's
-              # first-parent history in steps of CHUNK commits, oldest first.
-              git rev-list --reverse --first-parent "$head" | awk -v n="$CHUNK" 'NR % n == 0' |
-                while read -r sha; do g push --quiet "$target" "$sha:refs/heads/$head"; done
-            fi
-            g push --quiet "$target" "refs/heads/$head:refs/heads/$head"
-            g push --quiet --all "$target"
-            g push --quiet --tags "$target"
-          else
-            # Refs are there: an earlier job stopped before its marker. Fetch only the tip.
-            git init --bare --quiet src.git
-            cd src.git
-            head=$(g ls-remote --symref "$target" HEAD | awk '/^ref:/ {sub("refs/heads/","",$2); print $2}')
-            g fetch --quiet --depth 1 "$target" "refs/heads/$head:refs/heads/$head"
+          # Every push has a hard time limit: a push GitHub refused has been seen to hang
+          # until the job timeout (pilot, 2026-11-12). A failed push fails the job before
+          # the marker, so a re-dispatch resumes the slot.
+          p() { timeout "$PUSH_TIMEOUT" git -c "http.https://github.com/.extraheader=$auth" push --quiet "$target" "$@"; }
+
+          # --bare takes refs/heads and refs/tags only: never refs/pull/*, which GitHub
+          # refuses to receive (hidden refs). The source is public: no credential. A slot
+          # that already holds refs (an earlier job stopped before its marker) is cloned
+          # and pushed again too: refs already there are no-ops, missing ones (tags) land.
+          remote_heads=$(g ls-remote --heads "$target")
+          git clone --bare --quiet "https://github.com/$SOURCE.git" src.git
+          cd src.git
+          head=$(git symbolic-ref --short HEAD)
+          if [ -z "$remote_heads" ] && [ "$CHUNK" -gt 0 ]; then
+            # Trap c: stay under the 2 GB push limit by pushing the default branch's
+            # first-parent history in steps of CHUNK commits, oldest first.
+            git rev-list --reverse --first-parent "$head" | awk -v n="$CHUNK" 'NR % n == 0' |
+              while read -r sha; do p "$sha:refs/heads/$head"; done
           fi
+          p "refs/heads/$head:refs/heads/$head"
+          p --all
+          # Trap g: secret-scanning push protection (on by default in public repositories)
+          # times out on one push of ~1300+ tags and refuses every one of them (GH013 "The
+          # Secrets detected rule did not run because of a timeout"). Tags go in batches.
+          batch=()
+          while read -r ref <&3; do
+            batch+=("$ref")
+            if [ "${#batch[@]}" -ge "$TAG_BATCH" ]; then p "${batch[@]}"; batch=(); fi
+          done 3< <(git for-each-ref --format='%(refname)' refs/tags)
+          [ "${#batch[@]}" -eq 0 ] || p "${batch[@]}"
+          echo "$NAME: pushed $(git for-each-ref refs/heads | wc -l) branches and $(git for-each-ref refs/tags | wc -l) tags"
 
           # The marker: one small unique file on its own branch, on top of the default
           # branch, so no two fleet repositories are identical (trap e: its presence is
